@@ -17,14 +17,19 @@ public:
   ParallelGripperControllerHandle(const rclcpp::Node::SharedPtr &node,
                                   const std::string &name,
                                   const std::string &ns,
-                                  const std::vector<std::string> &resources,
-                                  const double max_effort = 0.0)
+                                  const std::vector<std::string> &resources)
       : ActionBasedControllerHandle<
             control_msgs::action::ParallelGripperCommand>(
-            node, name, ns, "parallel_gripper_controller_handle"),
-        allow_failure_(false), parallel_jaw_gripper_(false),
-        max_effort_(max_effort),
-        command_joints_(resources.begin(), resources.end()) {}
+            node, name, ns, "parallel_gripper_controller_handle") {
+    std::set<std::string_view> command_joints(resources.begin(),
+                                              resources.end());
+    if (command_joints.size() != 1) {
+      RCLCPP_ERROR_STREAM(logger_, "ParallelGripperControllerHandle expects "
+                                   "exactly one command joint, but got "
+                                       << command_joints.size());
+    }
+    command_joint_ = *command_joints.begin();
+  }
 
   bool
   sendTrajectory(const moveit_msgs::msg::RobotTrajectory &trajectory) override {
@@ -46,9 +51,8 @@ public:
     }
 
     if (trajectory.joint_trajectory.points.empty()) {
-      RCLCPP_ERROR(
-          logger_,
-          "GripperController requires at least one joint trajectory point.");
+      RCLCPP_ERROR(logger_, "ParallelGripperController requires at least one "
+                            "joint trajectory point.");
       return false;
     }
 
@@ -63,57 +67,49 @@ public:
       return false;
     }
 
-    std::vector<std::size_t> gripper_joint_indexes;
-    for (std::size_t i = 0; i < trajectory.joint_trajectory.joint_names.size();
-         ++i) {
-      if (command_joints_.find(trajectory.joint_trajectory.joint_names[i]) !=
-          command_joints_.end()) {
-        gripper_joint_indexes.push_back(i);
-        if (!parallel_jaw_gripper_)
-          break;
-      }
+    const auto command_joint_it = std::find(
+        trajectory.joint_trajectory.joint_names.begin(),
+        trajectory.joint_trajectory.joint_names.end(), command_joint_);
+    if (command_joint_it == trajectory.joint_trajectory.joint_names.end()) {
+      RCLCPP_ERROR_STREAM(logger_, "Input trajectory doesn't contain the "
+                                   "command joint: "
+                                       << command_joint_);
+      return false;
     }
-
-    if (gripper_joint_indexes.empty()) {
-      RCLCPP_WARN(
-          logger_,
-          "No command_joint was specified for the MoveIt controller parallel gripper handle. \
-                      Please see ParallelGripperControllerHandle::addCommandJoint() and \
-                      ParallelGripperControllerHandle::setCommandJoint(). Assuming index 0.");
-      gripper_joint_indexes.push_back(0);
-    }
+    std::size_t gripper_joint_index = std::distance(
+        trajectory.joint_trajectory.joint_names.begin(), command_joint_it);
 
     // goal to be sent
     control_msgs::action::ParallelGripperCommand::Goal goal;
-    goal.command.position.resize(gripper_joint_indexes.size(), 0.0);
-    goal.command.effort.resize(gripper_joint_indexes.size(), 0.0);
+    goal.command.position = {0.0};
 
     // send last point
     int tpoint = trajectory.joint_trajectory.points.size() - 1;
     RCLCPP_DEBUG(logger_, "Sending command from trajectory point %d", tpoint);
 
-    // fill in goal from last point
-    for (std::size_t i = 0; i < gripper_joint_indexes.size(); ++i) {
-      const auto idx = gripper_joint_indexes[i];
-      if (trajectory.joint_trajectory.points[tpoint].positions.size() <= idx) {
-        RCLCPP_ERROR(
-            logger_,
-            "ParallelGripperController expects a joint trajectory with one \
+    if (trajectory.joint_trajectory.points[tpoint].positions.size() <=
+        gripper_joint_index) {
+      RCLCPP_ERROR(
+          logger_,
+          "ParallelGripperController expects a joint trajectory with one \
                          point that specifies at least the position of joint \
                          '%s', but insufficient positions provided",
-            trajectory.joint_trajectory.joint_names[idx].c_str());
-        return false;
-      }
-      goal.command.position[i] +=
-          trajectory.joint_trajectory.points[tpoint].positions[idx];
+          trajectory.joint_trajectory.joint_names[gripper_joint_index].c_str());
+      return false;
+    }
+    goal.command.position[0] += trajectory.joint_trajectory.points[tpoint]
+                                    .positions[gripper_joint_index];
 
-      // TODO: Should we enforce that effort is always specified?
-      if (trajectory.joint_trajectory.points[tpoint].effort.size() > idx) {
-        goal.command.effort[i] =
-            trajectory.joint_trajectory.points[tpoint].effort[idx];
-      } else {
-        goal.command.effort[i] = max_effort_;
-      }
+    if (trajectory.joint_trajectory.points[tpoint].effort.size() >
+        gripper_joint_index) {
+      goal.command.effort = {trajectory.joint_trajectory.points[tpoint]
+                                 .effort[gripper_joint_index]};
+    } else {
+      RCLCPP_WARN_STREAM(
+          logger_,
+          "No effort specified for joint "
+              << trajectory.joint_trajectory.joint_names[gripper_joint_index]
+              << ". Sending without effort.");
     }
     rclcpp_action::Client<control_msgs::action::ParallelGripperCommand>::
         SendGoalOptions send_goal_options;
@@ -139,31 +135,12 @@ public:
     return true;
   }
 
-  void setCommandJoint(const std::string &name) {
-    command_joints_.clear();
-    addCommandJoint(name);
-  }
-
-  void addCommandJoint(const std::string &name) {
-    command_joints_.insert(name);
-  }
-
-  void allowFailure(bool allow) { allow_failure_ = allow; }
-
-  void setParallelJawGripper(const std::string &left,
-                             const std::string &right) {
-    addCommandJoint(left);
-    addCommandJoint(right);
-    parallel_jaw_gripper_ = true;
-  }
-
 private:
   void controllerDoneCallback(
       const rclcpp_action::ClientGoalHandle<
           control_msgs::action::ParallelGripperCommand>::WrappedResult
           &wrapped_result) override {
-    if (wrapped_result.code == rclcpp_action::ResultCode::ABORTED &&
-        allow_failure_) {
+    if (wrapped_result.code == rclcpp_action::ResultCode::ABORTED) {
       finishControllerExecution(rclcpp_action::ResultCode::SUCCEEDED);
     } else {
       finishControllerExecution(wrapped_result.code);
@@ -171,39 +148,9 @@ private:
   }
 
   /*
-   * Some gripper drivers may indicate a failure if they do not close all the
-   * way when an object is in the gripper.
-   */
-  bool allow_failure_;
-
-  /*
-   * A common setup is where there are two joints that each move
-   * half the overall distance. Thus, the command to the gripper
-   * should be the sum of the two joint distances.
-   *
-   * When this is set, command_joints_ should be of size 2,
-   * and the command will be the sum of the two joints.
-   */
-  bool parallel_jaw_gripper_;
-
-  /*
-   * The ``max_effort`` used in the GripperCommand message when no
-   * ``max_effort`` was specified in the requested trajectory. Defaults to
-   * ``0.0``.
-   */
-  double max_effort_;
-
-  /*
-   * A GripperCommand message has only a single float64 for the
-   * "command", thus only a single joint angle can be sent -- however,
-   * due to the complexity of making grippers look correct in a URDF,
-   * they typically have >1 joints. The "command_joint" is the joint
-   * whose position value will be sent in the GripperCommand action. A
-   * set of names is provided for acceptable joint names. If any of
-   * the joints specified is found, the value corresponding to that
-   * joint is considered the command.
-   */
-  std::set<std::string> command_joints_;
+   * A ParallelGripperCommand message has only a single float64 for the
+   * "command", thus only a single joint angle can be sent */
+  std::string command_joint_;
 };
 
 class ParallelGripperControllerAllocator : public ControllerHandleAllocator {
